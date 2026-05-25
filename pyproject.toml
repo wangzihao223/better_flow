@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "node-flow"
+version = "0.1.0"
+description = "A lightweight event-driven node graph runtime."
+readme = "README.md"
+requires-python = ">=3.14"
+license = {text = "MIT"}
+authors = [
+  {name = "Codex"}
+]
+keywords = ["workflow", "node", "event-driven", "runtime"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-name/node-flow"
+Repository = "https://github.com/your-name/node-flow"
+
+[tool.setuptools]
+packages = ["node_flow"]
+
