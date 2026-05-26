@@ -191,6 +191,32 @@ runtime.stop()
 
 这样主线程可以等待真实完成信号，而不是用 `time.sleep()` 猜执行时间。
 
+### Runtime 事件 hook / observer
+
+runtime hook 已经加上，外部可以通过 `add_hook()` / `remove_hook()` 订阅运行时事件。
+
+当前可观察事件包括：
+
+- `runtime_started`
+- `runtime_stopping`
+- `runtime_stopped`
+- `event_created`
+- `event_dispatched`
+- `task_submitted`
+- `node_started`
+- `node_finished`
+- `node_error`
+- `task_done`
+- `timer_tick`
+
+目标：
+
+```text
+runtime 一边运行，一边把内部状态变化通知给外部观察者。
+```
+
+hook 内部异常不会打断 runtime，runtime 会忽略该 hook 的异常并继续通知其他 hook。
+
 ## 当前返回值协议
 
 节点返回值由 runtime 统一处理：
@@ -231,6 +257,8 @@ runtime.stop()
 - `pending_count()` 追踪异步任务
 - `wait_until()` 等待业务完成信号
 - `stats()` 查看运行状态、pending 数量和资源信息
+- `add_hook()` 可以观察任务生命周期和事件分发
+- hook 内部异常不会打断 runtime
 
 运行测试：
 
@@ -240,26 +268,31 @@ python -m unittest discover -s tests
 
 ## 待处理问题
 
-### 1. Runtime 事件 hook / observer
+### 1. Runtime hook 增强
 
-当前 `stats()` 是快照式查询，只能主动查看状态，不能实时感知 runtime 内部发生了什么。
+第一版 hook 已完成，后续可以继续增强：
 
-下一步建议增加事件 hook：
+- 增加结构化 hook event 类型
+- 给任务分配稳定 task_id
+- 在 hook data 中加入 pending 快照
+- 支持按事件类型订阅
+- 支持默认日志 hook
 
-- `task_submitted`
-- `task_done`
-- `node_started`
-- `node_finished`
-- `node_error`
-- `event_dispatched`
-
-目标：
+第二版建议把 hook 从“全局回调”升级成“按事件类型订阅”：
 
 ```text
-runtime 一边运行，一边把内部状态变化通知给外部观察者。
+runtime.add_hook(global_hook)      # 监听全部事件
+runtime.on("node_error", hook)     # 只监听某一类事件
+runtime.on("task_done", hook)
+runtime.off("node_error", hook)
 ```
 
-这会让控制台监控、Web UI、日志系统和调试工具更容易接入。
+设计方向：
+
+- 保留全局 hook，适合统一日志和调试
+- 增加按事件类型的 hook，适合精细监听
+- hook 回调尽量只接收本事件的数据，不再要求手动判断 kind
+- 维持现有 hook 不破坏，向后兼容
 
 ### 2. Future 管理增强
 

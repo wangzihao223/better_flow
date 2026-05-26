@@ -489,6 +489,100 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertIn("timer_pending", stats)
         self.assertIn("total_pending", stats)
 
+    def test_hooks_observe_task_lifecycle_and_dispatch(self) -> None:
+        """Runtime hooks receive task, node, and dispatch events."""
+        events = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=2)
+
+        def hook(kind: str, data: dict) -> None:
+            events.append((kind, dict(data)))
+
+        runtime.add_hook(hook)
+
+        def start_fn(event: Event):
+            return {"value": event.payload["value"] + 1}
+
+        def sink_fn(event: Event):
+            done.set()
+            return None
+
+        start = runtime.register(FunctionNode("start", start_fn))
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(start, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(start, {"value": 1})
+            self.assertTrue(done.wait(2), "hook test flow did not finish")
+        finally:
+            runtime.stop()
+
+        kinds = [kind for kind, _ in events]
+        self.assertIn("runtime_started", kinds)
+        self.assertIn("event_created", kinds)
+        self.assertIn("task_submitted", kinds)
+        self.assertIn("node_started", kinds)
+        self.assertIn("node_finished", kinds)
+        self.assertIn("task_done", kinds)
+        self.assertIn("event_dispatched", kinds)
+
+        self.assertTrue(
+            any(
+                kind == "event_dispatched"
+                and data["source"] == "start"
+                and data["target"] == "sink"
+                for kind, data in events
+            )
+        )
+        self.assertTrue(
+            any(
+                kind == "task_done"
+                and data["node_id"] == "sink"
+                and data["success"] is True
+                for kind, data in events
+            )
+        )
+
+    def test_hook_errors_do_not_break_runtime(self) -> None:
+        """A failing hook is ignored so runtime execution can continue."""
+        events = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=1)
+
+        def broken_hook(kind: str, data: dict) -> None:
+            raise RuntimeError("hook failed")
+
+        def recorder(kind: str, data: dict) -> None:
+            events.append((kind, dict(data)))
+            if kind == "node_error":
+                done.set()
+
+        runtime.add_hook(broken_hook)
+        runtime.add_hook(recorder)
+
+        def bad_fn(event: Event):
+            raise ValueError("bad")
+
+        bad = runtime.register(FunctionNode("bad", bad_fn))
+
+        runtime.start()
+        try:
+            runtime.trigger(bad, {"value": 1})
+            self.assertTrue(done.wait(2), "node_error hook was not emitted")
+        finally:
+            runtime.stop()
+
+        self.assertEqual(len(runtime.errors), 1)
+        self.assertTrue(
+            any(
+                kind == "node_error"
+                and data["node_id"] == "bad"
+                and data["error_type"] == "ValueError"
+                for kind, data in events
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

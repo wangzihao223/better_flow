@@ -19,6 +19,7 @@
 - 支持 `TimerSource` 定时触发
 - 支持 `wait_until()` 等待外部完成信号
 - 支持 `stats()` 和 `pending_stats()` 查看运行状态
+- 支持 `add_hook()` / `remove_hook()` 订阅 runtime 事件
 - 支持基础错误收集 `runtime.errors`
 
 ## 安装
@@ -141,6 +142,24 @@ stats = runtime.stats()
 pending = runtime.pending_stats()
 ```
 
+### 运行时 hook
+
+```python
+def on_runtime_event(kind, data):
+    print(kind, data)
+
+
+runtime.add_hook(on_runtime_event)
+```
+
+hook 可用于实时记录：
+
+- 节点开始和结束
+- 事件分发
+- 任务提交和完成
+- 错误记录
+- runtime 启停
+
 ## 已有节点
 
 - `FunctionNode`
@@ -165,3 +184,11 @@ python -m unittest discover -s tests
 ```bash
 python -m compileall node_flow tests
 ```
+
+## 示例文件
+
+- `examples/basic_flow.py`
+- `examples/parallel_io.py`
+- `examples/parallel_async.py`
+- `examples/parallel_cpu.py`
+- `examples/runtime_hooks.py`

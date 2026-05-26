@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-"""运行时调度器。
+"""Runtime for workflow nodes.
 
-WorkflowRuntime 负责节点注册、事件分发、线程池、进程池、asyncio
-事件循环和定时触发。图结构本身交给 WorkflowGraph 维护。
+WorkflowRuntime owns registration, dispatching, thread/process executors,
+the shared asyncio loop, timer scheduling, and runtime hooks.
 """
 
 import asyncio
@@ -11,7 +11,7 @@ import os
 import threading
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 from .event import Event
 from .graph import WorkflowGraph
@@ -19,18 +19,15 @@ from .nodes import BaseNode, ExecutionMode, FunctionNode, TimerSource
 
 
 def _run_cpu_func(func, event: Event):
-    """在进程池中运行 CPU 节点函数。"""
+    """Run a CPU node function in a process pool worker."""
     return func(event)
 
 
 class WorkflowRuntime:
-    """节点图的统一运行时。"""
+    """Unified runtime for a node graph."""
 
     def __init__(self, max_workers: int = 8, max_cpu_workers: int | None = None):
-        """初始化运行时资源。
-
-        max_workers 控制同步/IO 线程池大小，max_cpu_workers 控制 CPU 进程池大小。
-        """
+        """Create executors, graph, and runtime bookkeeping."""
         self.max_workers = max_workers
         self.max_cpu_workers = max_cpu_workers
         self.io_executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -44,21 +41,48 @@ class WorkflowRuntime:
         self._async_futures: set[Future] = set()
         self._future_lock = threading.Lock()
         self._timer_futures: list[Future] = []
+        self._hooks: list[Callable[[str, dict[str, Any]], None]] = []
+        self._hook_lock = threading.Lock()
         self.running = False
         self._loop_thread: threading.Thread | None = None
 
     def register(self, node: BaseNode) -> BaseNode:
-        """注册节点，并把 runtime 绑定到节点上。"""
+        """Register a node and bind the runtime to it."""
         self.graph.add_node(node)
         node.bind_runtime(self)
         return node
 
     def connect(self, source: BaseNode, target: BaseNode) -> BaseNode:
-        """连接两个节点，表示 source 的事件可以流向 target。"""
+        """Connect two nodes in the graph."""
         return self.graph.connect(source, target)
 
+    def add_hook(
+        self, hook: Callable[[str, dict[str, Any]], None]
+    ) -> Callable[[str, dict[str, Any]], None]:
+        """Register a runtime hook."""
+        with self._hook_lock:
+            if hook not in self._hooks:
+                self._hooks.append(hook)
+        return hook
+
+    def remove_hook(self, hook: Callable[[str, dict[str, Any]], None]) -> None:
+        """Remove a previously registered hook."""
+        with self._hook_lock:
+            if hook in self._hooks:
+                self._hooks.remove(hook)
+
+    def _emit_hook(self, kind: str, **data: Any) -> None:
+        """Notify all hooks about a runtime event."""
+        with self._hook_lock:
+            hooks = list(self._hooks)
+        for hook in hooks:
+            try:
+                hook(kind, data)
+            except Exception:
+                continue
+
     def start(self) -> None:
-        """启动运行时。"""
+        """Start the runtime."""
         if self.running:
             return
         self.running = True
@@ -68,11 +92,13 @@ class WorkflowRuntime:
             node.start()
             if isinstance(node, TimerSource):
                 self._start_timer(node)
+        self._emit_hook("runtime_started", node_count=len(self.nodes))
 
     def stop(self) -> None:
-        """停止运行时，并等待已经提交的任务完成。"""
+        """Stop the runtime and wait for submitted work to settle."""
         if not self.running:
             return
+        self._emit_hook("runtime_stopping")
         self.running = False
         for node in self.nodes.values():
             node.stop()
@@ -97,25 +123,38 @@ class WorkflowRuntime:
             self.loop.close()
         self.io_executor.shutdown(wait=True, cancel_futures=False)
         self.cpu_executor.shutdown(wait=True, cancel_futures=False)
+        self._emit_hook("runtime_stopped")
 
     def _run_loop(self) -> None:
-        """在独立线程中运行 asyncio 事件循环。"""
+        """Run the shared asyncio loop in a dedicated thread."""
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
     def _start_timer(self, node: TimerSource) -> None:
-        """为 TimerSource 启动共享事件循环中的定时任务。"""
+        """Start one timer task on the shared asyncio loop."""
         future = asyncio.run_coroutine_threadsafe(self._run_timer(node), self.loop)
         self._timer_futures.append(future)
+        self._emit_hook(
+            "task_submitted",
+            node_id=node.node_id,
+            event_id=None,
+            executor="timer",
+        )
 
     async def _run_timer(self, node: TimerSource) -> None:
-        """在共享的 asyncio loop 中运行单个 timer。"""
+        """Run one timer task on the shared asyncio loop."""
         try:
             count = 0
             while self.running and (
                 node.count_limit is None or count < node.count_limit
             ):
                 payload = node.make_payload(count)
+                self._emit_hook(
+                    "timer_tick",
+                    node_id=node.node_id,
+                    count=count,
+                    interval=node.interval,
+                )
                 self.emit(node, payload, name="tick")
                 count += 1
                 await asyncio.sleep(node.interval)
@@ -123,60 +162,76 @@ class WorkflowRuntime:
             return
 
     def emit(self, source: BaseNode, payload, name: str = "event") -> Event:
-        """从 source 节点创建一个新事件，并分发给它的下游节点。"""
+        """Create an event from source and dispatch it to downstream nodes."""
         event = Event(source=source.node_id, name=name, payload=payload)
+        self._emit_hook(
+            "event_created",
+            source=source.node_id,
+            event_id=event.event_id,
+            name=event.name,
+        )
         self.dispatch(source, event)
         return event
 
     def trigger(self, node: BaseNode, payload, name: str = "event") -> Event:
-        """把事件投递给指定节点自己，触发该节点执行。"""
+        """Trigger a node directly."""
         event = Event(source="runtime", name=name, payload=payload)
+        self._emit_hook(
+            "event_created",
+            source="runtime",
+            event_id=event.event_id,
+            name=event.name,
+        )
         self._submit(node, event)
         return event
 
     def forward(self, source: BaseNode, event: Event) -> None:
-        """转发已有事件。"""
+        """Forward an existing event."""
         event.source = source.node_id
         self.dispatch(source, event)
 
     def _build_event(self, event: Event, source: BaseNode, target: BaseNode) -> Event:
-        """复制事件并记录它即将流向的目标节点。"""
+        """Clone an event for the next downstream hop."""
         target_event = event.fork(target.node_id)
         target_event.source = source.node_id
         target_event.route_targets = None
         return target_event
 
     def dispatch(self, source: BaseNode, event: Event) -> None:
-        """把事件从 source 分发给它的下游节点。"""
+        """Dispatch an event to downstream nodes."""
         targets = self.graph.downstream(source)
         if event.route_targets is not None:
             route_targets = set(event.route_targets)
             targets = [target for target in targets if target.node_id in route_targets]
         for target in targets:
             target_event = self._build_event(event, source, target)
+            self._emit_hook(
+                "event_dispatched",
+                source=source.node_id,
+                target=target.node_id,
+                event_id=target_event.event_id,
+                name=target_event.name,
+                route_targets=event.route_targets,
+            )
             self._submit(target, target_event)
 
     def broadcast(self, targets: Iterable[BaseNode], event: Event) -> None:
-        """把同一个事件广播给指定的一组目标节点。"""
+        """Broadcast an event to a fixed list of targets."""
         for target in targets:
             target_event = event.fork(target.node_id)
             self._submit(target, target_event)
 
     def pending_count(self) -> int:
-        """返回当前仍未完成的任务数量。"""
+        """Return the total number of unfinished tasks."""
         return self.pending_stats()["total_pending"]
 
     def pending_stats(self) -> dict[str, int]:
-        """返回不同执行器上的未完成任务数量。"""
+        """Return a split view of unfinished tasks by executor."""
         with self._future_lock:
             return self._pending_stats_unlocked()
 
     def stats(self) -> dict:
-        """返回 runtime 当前状态和进程资源信息。
-
-        如果安装了 psutil，会包含 CPU、内存、线程数、当前 CPU 核等信息。
-        如果没有安装 psutil，则只返回标准库可以获取的基础信息。
-        """
+        """Return runtime state and optional process resource data."""
         pending_stats = self.pending_stats()
         data = {
             "running": self.running,
@@ -221,7 +276,7 @@ class WorkflowRuntime:
         return data
 
     def _pending_stats_unlocked(self) -> dict[str, int]:
-        """在持有 _future_lock 时构造 pending 统计快照。"""
+        """Build the pending snapshot while holding _future_lock."""
         sync_pending = len(self._sync_futures)
         cpu_pending = len(self._cpu_futures)
         async_pending = len(self._async_futures)
@@ -237,11 +292,11 @@ class WorkflowRuntime:
     def wait_until(
         self, done_event: threading.Event, timeout: float | None = None
     ) -> bool:
-        """阻塞等待一个外部完成信号。"""
+        """Block until an external completion signal is set."""
         return done_event.wait(timeout)
 
     def _track_future(self, future: Future, bucket: set[Future]) -> Future:
-        """追踪未完成任务，并在任务结束后自动移除。"""
+        """Track a future and remove it automatically when done."""
         with self._future_lock:
             bucket.add(future)
 
@@ -253,9 +308,15 @@ class WorkflowRuntime:
         return future
 
     def _submit(self, target: BaseNode, event: Event) -> None:
-        """根据目标节点的执行模式，把任务提交到合适的执行器。"""
+        """Submit a task to the correct executor."""
         if not self.running:
             return
+        self._emit_hook(
+            "task_submitted",
+            node_id=target.node_id,
+            event_id=event.event_id,
+            executor=target.execution_mode.value,
+        )
         if target.execution_mode == ExecutionMode.CPU:
             if not isinstance(target, FunctionNode):
                 self._handle_error(
@@ -263,7 +324,20 @@ class WorkflowRuntime:
                     event,
                     TypeError("CPU nodes must expose a picklable func attribute"),
                 )
+                self._emit_hook(
+                    "task_done",
+                    node_id=target.node_id,
+                    event_id=event.event_id,
+                    executor=target.execution_mode.value,
+                    success=False,
+                )
                 return
+            self._emit_hook(
+                "node_started",
+                node_id=target.node_id,
+                event_id=event.event_id,
+                executor=target.execution_mode.value,
+            )
             future = self.cpu_executor.submit(_run_cpu_func, target.func, event)
             self._track_future(future, self._cpu_futures)
             future.add_done_callback(
@@ -280,40 +354,112 @@ class WorkflowRuntime:
         self._track_future(future, self._sync_futures)
 
     def _execute_node_sync(self, node: BaseNode, event: Event) -> None:
-        """在线程池里执行同步节点。"""
+        """Execute a sync node in the thread pool."""
         if not self.running or not node.running:
             return
+        self._emit_hook(
+            "node_started",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            executor=node.execution_mode.value,
+        )
         try:
             result = node.process(event)
         except Exception as exc:
             self._handle_error(node, event, exc)
+            self._emit_hook(
+                "task_done",
+                node_id=node.node_id,
+                event_id=event.event_id,
+                executor=node.execution_mode.value,
+                success=False,
+            )
             return
         self._handle_result(node, event, result)
+        self._emit_hook(
+            "node_finished",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            executor=node.execution_mode.value,
+        )
+        self._emit_hook(
+            "task_done",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            executor=node.execution_mode.value,
+            success=True,
+        )
 
     def _handle_cpu_result(self, node: BaseNode, event: Event, future) -> None:
-        """处理进程池任务完成后的返回值。"""
+        """Handle the final result of a process-pool task."""
         if not self.running or not node.running:
             return
         try:
             result = future.result()
         except Exception as exc:
             self._handle_error(node, event, exc)
+            self._emit_hook(
+                "task_done",
+                node_id=node.node_id,
+                event_id=event.event_id,
+                executor=node.execution_mode.value,
+                success=False,
+            )
             return
         self._handle_result(node, event, result)
+        self._emit_hook(
+            "node_finished",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            executor=node.execution_mode.value,
+        )
+        self._emit_hook(
+            "task_done",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            executor=node.execution_mode.value,
+            success=True,
+        )
 
     async def _execute_node_async(self, node: BaseNode, event: Event) -> None:
-        """在 asyncio loop 中执行异步节点。"""
+        """Execute an async node on the shared asyncio loop."""
         if not self.running or not node.running:
             return
+        self._emit_hook(
+            "node_started",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            executor=node.execution_mode.value,
+        )
         try:
             result = await node.process_async(event)  # type: ignore[attr-defined]
         except Exception as exc:
             self._handle_error(node, event, exc)
+            self._emit_hook(
+                "task_done",
+                node_id=node.node_id,
+                event_id=event.event_id,
+                executor=node.execution_mode.value,
+                success=False,
+            )
             return
         self._handle_result(node, event, result)
+        self._emit_hook(
+            "node_finished",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            executor=node.execution_mode.value,
+        )
+        self._emit_hook(
+            "task_done",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            executor=node.execution_mode.value,
+            success=True,
+        )
 
     def _handle_error(self, node: BaseNode, event: Event, exc: Exception) -> None:
-        """记录节点执行错误，并停止当前分支继续传播。"""
+        """Record a node error and stop propagation on this branch."""
         error_event = Event(
             source=node.node_id,
             name="error",
@@ -327,9 +473,16 @@ class WorkflowRuntime:
             trace=[*event.trace],
         )
         self.errors.append(error_event)
+        self._emit_hook(
+            "node_error",
+            node_id=node.node_id,
+            event_id=event.event_id,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
 
     def _handle_result(self, node: BaseNode, event: Event, result) -> None:
-        """把节点返回值转换成后续事件传播行为。"""
+        """Convert a node result into downstream dispatch behavior."""
         if result is None:
             return
         if isinstance(result, Event):
