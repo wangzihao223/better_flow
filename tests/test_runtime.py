@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import unittest
 
 from node_flow import (
@@ -360,6 +361,68 @@ class RuntimeEntryTests(unittest.TestCase):
             runtime.stop()
 
         self.assertEqual(calls, [{"allow": True}])
+
+    def test_pending_count_tracks_sync_futures(self) -> None:
+        """Runtime tracks unfinished sync futures and removes them when done."""
+        started = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=1)
+
+        def slow_fn(event: Event):
+            started.set()
+            release.wait(2)
+            done.set()
+            return None
+
+        slow = runtime.register(FunctionNode("slow", slow_fn))
+
+        runtime.start()
+        try:
+            runtime.trigger(slow, {"value": 1})
+            self.assertTrue(started.wait(2), "slow node did not start")
+            self.assertGreaterEqual(runtime.pending_count(), 1)
+            release.set()
+            self.assertTrue(done.wait(2), "slow node did not finish")
+
+            for _ in range(20):
+                if runtime.pending_count() == 0:
+                    break
+                time.sleep(0.05)
+        finally:
+            runtime.stop()
+
+        self.assertEqual(runtime.pending_count(), 0)
+
+    def test_pending_count_tracks_async_futures(self) -> None:
+        """Runtime tracks unfinished async futures and removes them when done."""
+        calls = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=1)
+
+        async def slow_async_fn(event: Event):
+            await asyncio.sleep(0.1)
+            calls.append(dict(event.payload))
+            done.set()
+            return None
+
+        async_node = runtime.register(AsyncFunctionNode("slow_async", slow_async_fn))
+
+        runtime.start()
+        try:
+            runtime.trigger(async_node, {"value": 1})
+            self.assertGreaterEqual(runtime.pending_count(), 1)
+            self.assertTrue(done.wait(2), "async node did not finish")
+
+            for _ in range(20):
+                if runtime.pending_count() == 0:
+                    break
+                time.sleep(0.05)
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [{"value": 1}])
+        self.assertEqual(runtime.pending_count(), 0)
 
 
 if __name__ == "__main__":

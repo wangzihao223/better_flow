@@ -20,7 +20,7 @@
   - `RouterNode`
   - `PrintSink`
 - 项目已包装成 Python 库，并推送到 GitHub。
-- 已增加单元测试，当前测试数量：13。
+- 已增加单元测试，当前测试数量：15。
 
 ## 已完成的核心能力
 
@@ -97,6 +97,20 @@ event.route_targets == [...] -> 只发给指定下游
 
 `WorkflowRuntime.stop()` 会停止节点、等待 timer 线程、停止并关闭 asyncio loop，并关闭线程池/进程池。
 
+### Future 管理
+
+第一版 Future 管理已完成。
+
+当前能力：
+
+- runtime 会追踪 sync 节点提交到线程池的 future。
+- runtime 会追踪 async 节点提交到 asyncio loop 的 future。
+- runtime 会追踪 cpu 节点提交到进程池的 future。
+- future 完成后会自动从 runtime 的追踪集合中移除。
+- `runtime.pending_count()` 可以返回当前未完成任务数量。
+
+当前还不支持取消、超时和任务 ID。
+
 ## 当前返回值协议
 
 节点返回值由 runtime 统一处理：
@@ -123,6 +137,8 @@ event.route_targets == [...] -> 只发给指定下游
 - `CpuNode` 异常会进入 `runtime.errors`。
 - `TimerSource` 会按 `count_limit` 触发指定次数。
 - `FilterNode` 会放行 True 条件并阻断 False 条件。
+- `pending_count()` 会追踪同步任务，并在完成后归零。
+- `pending_count()` 会追踪异步任务，并在完成后归零。
 
 运行测试：
 
@@ -132,16 +148,17 @@ python -m unittest discover -s tests
 
 ## 待处理问题
 
-### 1. Future 管理
+### 1. Future 管理增强
 
-当前 future 提交后没有统一追踪。
+当前 Future 管理只追踪未完成任务数量。
 
-计划增加：
+后续计划增加：
 
-- pending/running/completed 任务统计
-- 超时
-- 取消
-- 优雅停止策略
+- running/completed/failed 任务统计。
+- 任务 ID。
+- 超时。
+- 取消。
+- 优雅停止策略。
 
 ### 2. 错误处理增强
 
@@ -237,7 +254,7 @@ node_flow/
 下一步建议优先做：
 
 ```text
-Future 管理 + stop 收尾测试 + payload 复制策略
+stop 收尾测试 + payload 复制策略 + Future 管理增强
 ```
 
 这几项会决定 runtime 是否能从“可跑”进入“可靠”。
