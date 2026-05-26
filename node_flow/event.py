@@ -27,8 +27,8 @@ class Event:
     created_at: float = field(default_factory=time.time)
     # 事件已经经过的节点路径，方便调试和可视化。
     trace: list[str] = field(default_factory=list)
-    # RouterNode 指定的目标节点列表。
-    route_targets: list[str] = field(default_factory=list)
+    # RouterNode 的路由目标。None 表示不限制，[] 表示明确不传播。
+    route_targets: list[str] | None = None
 
     def fork(self, target: str) -> "Event":
         # 分发到下游节点时复制事件，避免多个分支互相污染 payload/trace。

@@ -126,13 +126,13 @@ class WorkflowRuntime:
         """复制事件并记录它即将流向的目标节点。"""
         target_event = event.fork(target.node_id)
         target_event.source = source.node_id
-        target_event.route_targets = []
+        target_event.route_targets = None
         return target_event
 
     def dispatch(self, source: BaseNode, event: Event) -> None:
         """把事件从 source 分发给它的下游节点。"""
         targets = self.graph.downstream(source)
-        if event.route_targets:
+        if event.route_targets is not None:
             route_targets = set(event.route_targets)
             targets = [target for target in targets if target.node_id in route_targets]
         for target in targets:

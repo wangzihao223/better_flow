@@ -119,6 +119,29 @@ class RuntimeEntryTests(unittest.TestCase):
             ],
         )
 
+    def test_router_empty_route_stops_propagation(self) -> None:
+        """RouterNode returning an empty list means no downstream branch is selected."""
+        calls = []
+        runtime = WorkflowRuntime(max_workers=2)
+
+        router = runtime.register(RouterNode("router", lambda event: []))
+
+        def sink_fn(event: Event):
+            calls.append(("sink", dict(event.payload)))
+            return None
+
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(router, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(router, {"kind": "none"})
+            threading.Event().wait(0.1)
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
