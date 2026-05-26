@@ -7,6 +7,7 @@ WorkflowRuntime 负责节点注册、事件分发、线程池、进程池、asyn
 """
 
 import asyncio
+import os
 import threading
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
@@ -38,7 +39,9 @@ class WorkflowRuntime:
         self.graph = WorkflowGraph()
         self.nodes = self.graph.nodes
         self.errors: list[Event] = []
-        self._futures: set[Future] = set()
+        self._sync_futures: set[Future] = set()
+        self._cpu_futures: set[Future] = set()
+        self._async_futures: set[Future] = set()
         self._future_lock = threading.Lock()
         self._timer_futures: list[Future] = []
         self.running = False
@@ -161,17 +164,90 @@ class WorkflowRuntime:
 
     def pending_count(self) -> int:
         """返回当前仍未完成的任务数量。"""
-        with self._future_lock:
-            return len(self._futures)
+        return self.pending_stats()["total_pending"]
 
-    def _track_future(self, future: Future) -> Future:
+    def pending_stats(self) -> dict[str, int]:
+        """返回不同执行器上的未完成任务数量。"""
+        with self._future_lock:
+            return self._pending_stats_unlocked()
+
+    def stats(self) -> dict:
+        """返回 runtime 当前状态和进程资源信息。
+
+        如果安装了 psutil，会包含 CPU、内存、线程数、当前 CPU 核等信息。
+        如果没有安装 psutil，则只返回标准库可以获取的基础信息。
+        """
+        pending_stats = self.pending_stats()
+        data = {
+            "running": self.running,
+            "node_count": len(self.nodes),
+            "pending_count": pending_stats["total_pending"],
+            "pending_stats": pending_stats,
+            "error_count": len(self.errors),
+            "timer_count": len(self._timer_futures),
+            "cpu_count": os.cpu_count(),
+            "loop_thread_alive": (
+                self._loop_thread is not None and self._loop_thread.is_alive()
+            ),
+        }
+
+        try:
+            import psutil  # type: ignore[import-not-found]
+        except ImportError:
+            data["psutil_available"] = False
+            return data
+
+        process = psutil.Process()
+        data.update(
+            {
+                "psutil_available": True,
+                "pid": process.pid,
+                "cpu_percent": process.cpu_percent(interval=None),
+                "memory_rss": process.memory_info().rss,
+                "thread_count": process.num_threads(),
+            }
+        )
+
+        try:
+            data["cpu_num"] = process.cpu_num()
+        except Exception:
+            data["cpu_num"] = None
+
+        try:
+            data["cpu_affinity"] = process.cpu_affinity()
+        except Exception:
+            data["cpu_affinity"] = None
+
+        return data
+
+    def _pending_stats_unlocked(self) -> dict[str, int]:
+        """在持有 _future_lock 时构造 pending 统计快照。"""
+        sync_pending = len(self._sync_futures)
+        cpu_pending = len(self._cpu_futures)
+        async_pending = len(self._async_futures)
+        timer_pending = len(self._timer_futures)
+        return {
+            "sync_pending": sync_pending,
+            "cpu_pending": cpu_pending,
+            "async_pending": async_pending,
+            "timer_pending": timer_pending,
+            "total_pending": sync_pending + cpu_pending + async_pending,
+        }
+
+    def wait_until(
+        self, done_event: threading.Event, timeout: float | None = None
+    ) -> bool:
+        """阻塞等待一个外部完成信号。"""
+        return done_event.wait(timeout)
+
+    def _track_future(self, future: Future, bucket: set[Future]) -> Future:
         """追踪未完成任务，并在任务结束后自动移除。"""
         with self._future_lock:
-            self._futures.add(future)
+            bucket.add(future)
 
         def cleanup(done: Future) -> None:
             with self._future_lock:
-                self._futures.discard(done)
+                bucket.discard(done)
 
         future.add_done_callback(cleanup)
         return future
@@ -189,7 +265,7 @@ class WorkflowRuntime:
                 )
                 return
             future = self.cpu_executor.submit(_run_cpu_func, target.func, event)
-            self._track_future(future)
+            self._track_future(future, self._cpu_futures)
             future.add_done_callback(
                 lambda result: self._handle_cpu_result(target, event, result)
             )
@@ -198,10 +274,10 @@ class WorkflowRuntime:
             future = asyncio.run_coroutine_threadsafe(
                 self._execute_node_async(target, event), self.loop
             )
-            self._track_future(future)
+            self._track_future(future, self._async_futures)
             return
         future = self.io_executor.submit(self._execute_node_sync, target, event)
-        self._track_future(future)
+        self._track_future(future, self._sync_futures)
 
     def _execute_node_sync(self, node: BaseNode, event: Event) -> None:
         """在线程池里执行同步节点。"""

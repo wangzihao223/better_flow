@@ -449,6 +449,46 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(calls, [{"value": 1}])
         self.assertEqual(runtime.pending_count(), 0)
 
+    def test_wait_until_returns_when_event_is_set(self) -> None:
+        """Runtime.wait_until blocks until the completion event is set."""
+        runtime = WorkflowRuntime(max_workers=1)
+        done = threading.Event()
+
+        def signal_later() -> None:
+            time.sleep(0.1)
+            done.set()
+
+        threading.Thread(target=signal_later, daemon=True).start()
+
+        self.assertTrue(runtime.wait_until(done, timeout=1.0))
+
+    def test_stats_reports_basic_runtime_state(self) -> None:
+        """Runtime.stats returns basic runtime state without requiring psutil."""
+        runtime = WorkflowRuntime(max_workers=1)
+
+        stats = runtime.stats()
+
+        self.assertIn("running", stats)
+        self.assertIn("node_count", stats)
+        self.assertIn("pending_count", stats)
+        self.assertIn("error_count", stats)
+        self.assertIn("timer_count", stats)
+        self.assertIn("cpu_count", stats)
+        self.assertIn("loop_thread_alive", stats)
+        self.assertEqual(stats["pending_count"], stats["pending_stats"]["total_pending"])
+
+    def test_pending_stats_reports_split_counts(self) -> None:
+        """Runtime.pending_stats returns split counts for each executor."""
+        runtime = WorkflowRuntime(max_workers=1)
+
+        stats = runtime.pending_stats()
+
+        self.assertIn("sync_pending", stats)
+        self.assertIn("cpu_pending", stats)
+        self.assertIn("async_pending", stats)
+        self.assertIn("timer_pending", stats)
+        self.assertIn("total_pending", stats)
+
 
 if __name__ == "__main__":
     unittest.main()
