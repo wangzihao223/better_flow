@@ -2,13 +2,12 @@ from __future__ import annotations
 
 """运行时调度器。
 
-WorkflowRuntime 负责执行层：节点注册、事件分发、线程池、进程池、asyncio
+WorkflowRuntime 负责节点注册、事件分发、线程池、进程池、asyncio
 事件循环和定时触发。图结构本身交给 WorkflowGraph 维护。
 """
 
 import asyncio
 import threading
-import time
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 from typing import Iterable
@@ -41,9 +40,9 @@ class WorkflowRuntime:
         self.errors: list[Event] = []
         self._futures: set[Future] = set()
         self._future_lock = threading.Lock()
+        self._timer_futures: list[Future] = []
         self.running = False
         self._loop_thread: threading.Thread | None = None
-        self._timer_threads: list[threading.Thread] = []
 
     def register(self, node: BaseNode) -> BaseNode:
         """注册节点，并把 runtime 绑定到节点上。"""
@@ -56,11 +55,7 @@ class WorkflowRuntime:
         return self.graph.connect(source, target)
 
     def start(self) -> None:
-        """启动运行时。
-
-        这里只打开 runtime/node 状态和异步事件循环；普通节点不会立刻执行，
-        只有事件到达时才会被调度。
-        """
+        """启动运行时。"""
         if self.running:
             return
         self.running = True
@@ -78,9 +73,19 @@ class WorkflowRuntime:
         self.running = False
         for node in self.nodes.values():
             node.stop()
-        for thread in self._timer_threads:
-            thread.join(timeout=1.0)
-        self._timer_threads.clear()
+        for future in self._timer_futures:
+            future.cancel()
+        for future in self._timer_futures:
+            try:
+                future.result(timeout=1.0)
+            except Exception:
+                pass
+        self._timer_futures.clear()
+        drain = asyncio.run_coroutine_threadsafe(asyncio.sleep(0), self.loop)
+        try:
+            drain.result(timeout=1.0)
+        except Exception:
+            pass
         self.loop.call_soon_threadsafe(self.loop.stop)
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=1.0)
@@ -96,9 +101,13 @@ class WorkflowRuntime:
         self.loop.run_forever()
 
     def _start_timer(self, node: TimerSource) -> None:
-        """为 TimerSource 启动由 runtime 管理的定时触发循环。"""
+        """为 TimerSource 启动共享事件循环中的定时任务。"""
+        future = asyncio.run_coroutine_threadsafe(self._run_timer(node), self.loop)
+        self._timer_futures.append(future)
 
-        def loop() -> None:
+    async def _run_timer(self, node: TimerSource) -> None:
+        """在共享的 asyncio loop 中运行单个 timer。"""
+        try:
             count = 0
             while self.running and (
                 node.count_limit is None or count < node.count_limit
@@ -106,11 +115,9 @@ class WorkflowRuntime:
                 payload = node.make_payload(count)
                 self.emit(node, payload, name="tick")
                 count += 1
-                time.sleep(node.interval)
-
-        thread = threading.Thread(target=loop, daemon=True)
-        self._timer_threads.append(thread)
-        thread.start()
+                await asyncio.sleep(node.interval)
+        except asyncio.CancelledError:
+            return
 
     def emit(self, source: BaseNode, payload, name: str = "event") -> Event:
         """从 source 节点创建一个新事件，并分发给它的下游节点。"""
@@ -125,10 +132,7 @@ class WorkflowRuntime:
         return event
 
     def forward(self, source: BaseNode, event: Event) -> None:
-        """转发已有事件。
-
-        目前主要保留给兼容旧式节点调用；新节点更推荐通过返回值继续传播。
-        """
+        """转发已有事件。"""
         event.source = source.node_id
         self.dispatch(source, event)
 

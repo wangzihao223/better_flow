@@ -330,6 +330,31 @@ class RuntimeEntryTests(unittest.TestCase):
 
         self.assertEqual([payload["count"] for payload in payloads], [0, 1, 2])
 
+    def test_timer_source_shares_async_loop(self) -> None:
+        """TimerSource runs on the shared asyncio loop and still emits events."""
+        payloads = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=2)
+
+        timer = runtime.register(TimerSource("timer_shared", interval=0.01, count_limit=2))
+
+        def sink_fn(event: Event):
+            payloads.append(dict(event.payload))
+            if len(payloads) == 2:
+                done.set()
+            return None
+
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(timer, sink)
+
+        runtime.start()
+        try:
+            self.assertTrue(done.wait(2), "shared-loop timer did not emit expected events")
+        finally:
+            runtime.stop()
+
+        self.assertEqual([payload["count"] for payload in payloads], [0, 1])
+
     def test_filter_node_allows_true_and_blocks_false(self) -> None:
         """FilterNode propagates True predicates and blocks False predicates."""
         calls = []

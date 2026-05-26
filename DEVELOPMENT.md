@@ -20,7 +20,7 @@
   - `RouterNode`
   - `PrintSink`
 - 项目已包装成 Python 库，并推送到 GitHub。
-- 已增加单元测试，当前测试数量：15。
+- 已增加单元测试，当前测试数量：16。
 
 ## 已完成的核心能力
 
@@ -95,7 +95,26 @@ event.route_targets == [...] -> 只发给指定下游
 
 ### 资源收尾
 
-`WorkflowRuntime.stop()` 会停止节点、等待 timer 线程、停止并关闭 asyncio loop，并关闭线程池/进程池。
+`WorkflowRuntime.stop()` 会停止节点、取消 timer task、停止并关闭 asyncio loop，并关闭线程池/进程池。
+
+### TimerSource 调度
+
+`TimerSource` 已从“每个 timer 一个线程”改为“所有 timer 共享 runtime 的 asyncio loop”。
+
+当前行为：
+
+- `TimerSource` 本身只保存 tick 配置。
+- runtime 在 `start()` 时为每个 `TimerSource` 创建一个 asyncio timer task。
+- timer task 使用 `await asyncio.sleep(interval)` 控制 tick 间隔。
+- timer 到点后调用 `emit(node, payload, name="tick")` 把事件发给下游。
+- `stop()` 会取消 timer task，并在关闭 loop 前等待取消完成。
+
+设计原则：
+
+```text
+TimerSource 只负责 tick，不做重活。
+真正的 IO/CPU 工作交给下游节点。
+```
 
 ### Future 管理
 
@@ -136,6 +155,7 @@ event.route_targets == [...] -> 只发给指定下游
 - `CpuNode` 成功执行并继续传播。
 - `CpuNode` 异常会进入 `runtime.errors`。
 - `TimerSource` 会按 `count_limit` 触发指定次数。
+- `TimerSource` 共享 asyncio loop 后仍能正常触发。
 - `FilterNode` 会放行 True 条件并阻断 False 条件。
 - `pending_count()` 会追踪同步任务，并在完成后归零。
 - `pending_count()` 会追踪异步任务，并在完成后归零。
