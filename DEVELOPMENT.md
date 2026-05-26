@@ -20,7 +20,7 @@
   - `RouterNode`
   - `PrintSink`
 - 项目已包装成 Python 库，并推送到 GitHub。
-- 已增加单元测试，当前测试数量：6。
+- 已增加单元测试，当前测试数量：13。
 
 ## 已完成的核心能力
 
@@ -93,6 +93,10 @@ event.route_targets == [...] -> 只发给指定下游
 
 当前不会把 error event 自动投递到图中，后续如需要可以增加错误专用分支。
 
+### 资源收尾
+
+`WorkflowRuntime.stop()` 会停止节点、等待 timer 线程、停止并关闭 asyncio loop，并关闭线程池/进程池。
+
 ## 当前返回值协议
 
 节点返回值由 runtime 统一处理：
@@ -101,129 +105,6 @@ event.route_targets == [...] -> 只发给指定下游
 - 普通值：替换 `event.payload` 后继续传播。
 - `Event`：使用完整事件继续传播。
 - `list`：拆成多个事件继续传播。
-
-## 错误处理设计草案
-
-第一版错误处理先做“捕获、记录、停止当前分支”，不做复杂恢复。
-
-### 默认行为
-
-节点执行过程中发生异常时：
-
-```text
-捕获异常
--> 生成 error event
--> 放入 runtime.errors
--> 当前分支停止传播
-```
-
-默认不继续向下游传播，避免错误数据进入后续节点。
-
-### Runtime 新增状态
-
-计划在 `WorkflowRuntime` 中增加：
-
-```python
-self.errors: list[Event] = []
-```
-
-用于保存运行时捕获到的错误事件，方便测试、调试和后续监控。
-
-### error event 结构
-
-第一版先复用 `Event`，不单独增加 `ErrorEvent` 类。
-
-建议结构：
-
-```python
-Event(
-    source=node.node_id,
-    name="error",
-    payload={
-        "node_id": node.node_id,
-        "event_id": event.event_id,
-        "error_type": type(exc).__name__,
-        "error_message": str(exc),
-        "payload": event.payload,
-    },
-)
-```
-
-字段含义：
-
-- `node_id`：出错节点。
-- `event_id`：原始事件 ID。
-- `error_type`：异常类型。
-- `error_message`：异常消息。
-- `payload`：出错时的原始 payload。
-
-### Runtime 新增方法
-
-计划增加：
-
-```python
-def _handle_error(self, node: BaseNode, event: Event, exc: Exception) -> None:
-    ...
-```
-
-所有执行路径都统一走 `_handle_error()`：
-
-- `_execute_node_sync`
-- `_execute_node_async`
-- `_handle_cpu_result`
-
-### 同步节点错误处理
-
-```python
-def _execute_node_sync(self, node: BaseNode, event: Event) -> None:
-    if not self.running or not node.running:
-        return
-    try:
-        result = node.process(event)
-    except Exception as exc:
-        self._handle_error(node, event, exc)
-        return
-    self._handle_result(node, event, result)
-```
-
-### 异步节点错误处理
-
-```python
-async def _execute_node_async(self, node: BaseNode, event: Event) -> None:
-    if not self.running or not node.running:
-        return
-    try:
-        result = await node.process_async(event)
-    except Exception as exc:
-        self._handle_error(node, event, exc)
-        return
-    self._handle_result(node, event, result)
-```
-
-### CPU 节点错误处理
-
-```python
-def _handle_cpu_result(self, node: BaseNode, event: Event, future) -> None:
-    if not self.running or not node.running:
-        return
-    try:
-        result = future.result()
-    except Exception as exc:
-        self._handle_error(node, event, exc)
-        return
-    self._handle_result(node, event, result)
-```
-
-### 第一版测试目标
-
-至少增加一个测试：
-
-```text
-bad_node 抛异常
--> sink 不执行
--> runtime.errors 中存在一条 error event
--> error event 中记录 node_id、error_type、error_message 和原 payload
-```
 
 ## 当前测试覆盖
 
@@ -235,6 +116,13 @@ bad_node 抛异常
 - `WorkflowGraph` 会检查重复 `node_id`。
 - `RouterNode` 会只分发到指定分支。
 - `RouterNode` 返回空列表时停止传播。
+- 同步节点异常会进入 `runtime.errors`，并停止当前分支。
+- `AsyncFunctionNode` 成功执行并继续传播。
+- `AsyncFunctionNode` 异常会进入 `runtime.errors`。
+- `CpuNode` 成功执行并继续传播。
+- `CpuNode` 异常会进入 `runtime.errors`。
+- `TimerSource` 会按 `count_limit` 触发指定次数。
+- `FilterNode` 会放行 True 条件并阻断 False 条件。
 
 运行测试：
 
@@ -322,27 +210,14 @@ runtime = WorkflowRuntime(payload_copy_mode=PayloadCopyMode.DEEP)
 
 默认策略建议仍然使用 `DEEP`，保证早期行为安全。
 
-后续可扩展自定义复制函数：
-
-```python
-payload_copy_func: Callable[[Any], Any] | None = None
-```
-
-需要补充测试：
-
-- `DEEP`：一个分支修改嵌套 payload，另一个分支不受影响。
-- `SHALLOW`：外层容器不同，内层对象共享。
-- `REFERENCE`：多个分支拿到同一个 payload 对象。
-
 ### 5. 更多测试
 
 还需要补充：
 
-- `FilterNode` 阻断测试。
-- `AsyncFunctionNode` 执行测试。
-- `CpuNode` 执行测试。
-- `TimerSource` 定时触发测试。
 - `stop()` 收尾测试。
+- 多分支并发测试。
+- `Event.fork()` payload 复制策略测试。
+- `RouterNode` 多目标路由测试。
 
 ### 6. 包结构整理
 
@@ -362,7 +237,7 @@ node_flow/
 下一步建议优先做：
 
 ```text
-错误处理实现 + async/cpu/timer 测试 + Future 管理
+Future 管理 + stop 收尾测试 + payload 复制策略
 ```
 
 这几项会决定 runtime 是否能从“可跑”进入“可靠”。

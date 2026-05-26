@@ -18,6 +18,11 @@ from .graph import WorkflowGraph
 from .nodes import BaseNode, ExecutionMode, TimerSource
 
 
+def _run_cpu_func(func, event: Event):
+    """在进程池中运行 CPU 节点函数。"""
+    return func(event)
+
+
 class WorkflowRuntime:
     """节点图的统一运行时。"""
 
@@ -78,6 +83,8 @@ class WorkflowRuntime:
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=1.0)
             self._loop_thread = None
+        if not self.loop.is_closed():
+            self.loop.close()
         self.io_executor.shutdown(wait=True, cancel_futures=False)
         self.cpu_executor.shutdown(wait=True, cancel_futures=False)
 
@@ -151,7 +158,14 @@ class WorkflowRuntime:
         if not self.running:
             return
         if target.execution_mode == ExecutionMode.CPU:
-            future = self.cpu_executor.submit(target.process, event)
+            if not hasattr(target, "func"):
+                self._handle_error(
+                    target,
+                    event,
+                    TypeError("CPU nodes must expose a picklable func attribute"),
+                )
+                return
+            future = self.cpu_executor.submit(_run_cpu_func, target.func, event)
             future.add_done_callback(
                 lambda result: self._handle_cpu_result(target, event, result)
             )

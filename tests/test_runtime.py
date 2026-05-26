@@ -6,10 +6,28 @@ from __future__ import annotations
 下游开始传播事件。
 """
 
+import asyncio
 import threading
 import unittest
 
-from node_flow import Event, FunctionNode, RouterNode, WorkflowRuntime
+from node_flow import (
+    AsyncFunctionNode,
+    CpuNode,
+    Event,
+    FilterNode,
+    FunctionNode,
+    RouterNode,
+    TimerSource,
+    WorkflowRuntime,
+)
+
+
+def cpu_add_one(event: Event):
+    return {"value": event.payload["value"] + 1}
+
+
+def cpu_fail(event: Event):
+    raise RuntimeError("cpu failed")
 
 
 class RuntimeEntryTests(unittest.TestCase):
@@ -175,6 +193,173 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(error.payload["error_type"], "ValueError")
         self.assertEqual(error.payload["error_message"], "bad payload")
         self.assertEqual(error.payload["payload"], {"value": 1})
+
+    def test_async_node_result_reaches_downstream(self) -> None:
+        """AsyncFunctionNode runs on the asyncio loop and propagates its result."""
+        calls = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=2)
+
+        async def async_fn(event: Event):
+            await asyncio.sleep(0.5)
+            return {"value": event.payload["value"] + 1}
+
+        def sink_fn(event: Event):
+            calls.append(("sink", dict(event.payload)))
+            done.set()
+            return None
+
+        async_node = runtime.register(AsyncFunctionNode("async", async_fn))
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(async_node, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(async_node, {"value": 1})
+            self.assertTrue(done.wait(2), "async node did not reach sink")
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [("sink", {"value": 2})])
+
+    def test_async_node_error_is_recorded(self) -> None:
+        """AsyncFunctionNode errors are recorded and stop the branch."""
+        calls = []
+        runtime = WorkflowRuntime(max_workers=2)
+
+        async def bad_async_fn(event: Event):
+            raise RuntimeError("async failed")
+
+        def sink_fn(event: Event):
+            calls.append(("sink", dict(event.payload)))
+            return None
+
+        bad = runtime.register(AsyncFunctionNode("bad_async", bad_async_fn))
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(bad, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(bad, {"value": 1})
+            threading.Event().wait(0.1)
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [])
+        self.assertEqual(len(runtime.errors), 1)
+        self.assertEqual(runtime.errors[0].payload["node_id"], "bad_async")
+        self.assertEqual(runtime.errors[0].payload["error_type"], "RuntimeError")
+
+    def test_cpu_node_result_reaches_downstream(self) -> None:
+        """CpuNode runs in the process pool and propagates its result."""
+        calls = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=2, max_cpu_workers=1)
+
+        cpu = runtime.register(CpuNode("cpu", cpu_add_one))
+
+        def sink_fn(event: Event):
+            calls.append(("sink", dict(event.payload)))
+            done.set()
+            return None
+
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(cpu, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(cpu, {"value": 1})
+            self.assertTrue(done.wait(5), "cpu node did not reach sink")
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [("sink", {"value": 2})])
+
+    def test_cpu_node_error_is_recorded(self) -> None:
+        """CpuNode process-pool errors are recorded and stop the branch."""
+        calls = []
+        runtime = WorkflowRuntime(max_workers=2, max_cpu_workers=1)
+
+        bad = runtime.register(CpuNode("bad_cpu", cpu_fail))
+
+        def sink_fn(event: Event):
+            calls.append(("sink", dict(event.payload)))
+            return None
+
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(bad, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(bad, {"value": 1})
+            for _ in range(50):
+                if runtime.errors:
+                    break
+                threading.Event().wait(0.1)
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [])
+        self.assertEqual(len(runtime.errors), 1)
+        self.assertEqual(runtime.errors[0].payload["node_id"], "bad_cpu")
+        self.assertEqual(runtime.errors[0].payload["error_type"], "RuntimeError")
+
+    def test_timer_source_emits_count_limit_events(self) -> None:
+        """TimerSource emits the configured number of events."""
+        payloads = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=2)
+
+        timer = runtime.register(TimerSource("timer", interval=0.01, count_limit=3))
+
+        def sink_fn(event: Event):
+            payloads.append(dict(event.payload))
+            if len(payloads) == 3:
+                done.set()
+            return None
+
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(timer, sink)
+
+        runtime.start()
+        try:
+            self.assertTrue(done.wait(2), "timer did not emit expected events")
+        finally:
+            runtime.stop()
+
+        self.assertEqual([payload["count"] for payload in payloads], [0, 1, 2])
+
+    def test_filter_node_allows_true_and_blocks_false(self) -> None:
+        """FilterNode propagates True predicates and blocks False predicates."""
+        calls = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=2)
+
+        source = runtime.register(FunctionNode("source", lambda event: event.payload))
+        filter_node = runtime.register(
+            FilterNode("filter", lambda event: event.payload["allow"])
+        )
+
+        def sink_fn(event: Event):
+            calls.append(dict(event.payload))
+            if len(calls) == 1:
+                done.set()
+            return None
+
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(source, filter_node)
+        runtime.connect(filter_node, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(source, {"allow": True})
+            runtime.trigger(source, {"allow": False})
+            self.assertTrue(done.wait(2), "allowed event did not reach sink")
+            threading.Event().wait(0.1)
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [{"allow": True}])
 
 
 if __name__ == "__main__":
