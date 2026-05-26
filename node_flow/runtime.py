@@ -33,6 +33,7 @@ class WorkflowRuntime:
         self.loop = asyncio.new_event_loop()
         self.graph = WorkflowGraph()
         self.nodes = self.graph.nodes
+        self.errors: list[Event] = []
         self.running = False
         self._loop_thread: threading.Thread | None = None
         self._timer_threads: list[threading.Thread] = []
@@ -166,21 +167,50 @@ class WorkflowRuntime:
         """在线程池里执行同步节点。"""
         if not self.running or not node.running:
             return
-        result = node.process(event)
+        try:
+            result = node.process(event)
+        except Exception as exc:
+            self._handle_error(node, event, exc)
+            return
         self._handle_result(node, event, result)
 
     def _handle_cpu_result(self, node: BaseNode, event: Event, future) -> None:
         """处理进程池任务完成后的返回值。"""
         if not self.running or not node.running:
             return
-        self._handle_result(node, event, future.result())
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._handle_error(node, event, exc)
+            return
+        self._handle_result(node, event, result)
 
     async def _execute_node_async(self, node: BaseNode, event: Event) -> None:
         """在 asyncio loop 中执行异步节点。"""
         if not self.running or not node.running:
             return
-        result = await node.process_async(event)  # type: ignore[attr-defined]
+        try:
+            result = await node.process_async(event)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self._handle_error(node, event, exc)
+            return
         self._handle_result(node, event, result)
+
+    def _handle_error(self, node: BaseNode, event: Event, exc: Exception) -> None:
+        """记录节点执行错误，并停止当前分支继续传播。"""
+        error_event = Event(
+            source=node.node_id,
+            name="error",
+            payload={
+                "node_id": node.node_id,
+                "event_id": event.event_id,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "payload": event.payload,
+            },
+            trace=[*event.trace],
+        )
+        self.errors.append(error_event)
 
     def _handle_result(self, node: BaseNode, event: Event, result) -> None:
         """把节点返回值转换成后续事件传播行为。"""

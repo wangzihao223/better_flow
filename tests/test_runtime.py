@@ -142,6 +142,40 @@ class RuntimeEntryTests(unittest.TestCase):
 
         self.assertEqual(calls, [])
 
+    def test_sync_node_error_is_recorded_and_stops_branch(self) -> None:
+        """A failing sync node records an error event and does not call downstream."""
+        calls = []
+        runtime = WorkflowRuntime(max_workers=2)
+
+        def bad_fn(event: Event):
+            raise ValueError("bad payload")
+
+        def sink_fn(event: Event):
+            calls.append(("sink", dict(event.payload)))
+            return None
+
+        bad = runtime.register(FunctionNode("bad", bad_fn))
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(bad, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(bad, {"value": 1})
+            threading.Event().wait(0.1)
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [])
+        self.assertEqual(len(runtime.errors), 1)
+
+        error = runtime.errors[0]
+        self.assertEqual(error.source, "bad")
+        self.assertEqual(error.name, "error")
+        self.assertEqual(error.payload["node_id"], "bad")
+        self.assertEqual(error.payload["error_type"], "ValueError")
+        self.assertEqual(error.payload["error_message"], "bad payload")
+        self.assertEqual(error.payload["payload"], {"value": 1})
+
 
 if __name__ == "__main__":
     unittest.main()
