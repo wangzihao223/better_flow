@@ -8,6 +8,8 @@
 - `WorkflowRuntime` 负责节点注册、事件分发和执行资源管理。
 - 节点不直接管理线程、进程或事件循环，统一交给 runtime。
 - 项目已包装成 Python 库。
+- Runtime 生命周期已完成第一轮加固：`start()` 会等待 asyncio loop ready，`stop()` 会确认 loop 线程退出后再关闭 loop。
+- CPU 进程池已改为按需创建，并在已有 CPU 节点时于 loop 线程启动前预热。
 
 ## 运行模型
 
@@ -267,6 +269,46 @@ python -m unittest discover -s tests
 ```
 
 ## 待处理问题
+
+### 0. Runtime 生命周期加固（已完成第一轮）
+
+当前继续采用“后台 asyncio loop 子线程 + 其他线程通过
+`asyncio.run_coroutine_threadsafe()` 投递协程”的方案。
+
+第一轮已完成的改动：
+
+- `start()` 增加 loop ready 同步，async 节点和 `TimerSource` 不再抢在 loop ready 前提交。
+- asyncio loop 改为在线程内部创建、绑定并运行，避免在主线程创建后交给子线程运行。
+- `stop()` 改为投递 `_shutdown_loop()` coroutine，由 loop 自己取消 pending task 并调用 `loop.stop()`。
+- `stop()` 会确认 loop 线程退出后再关闭 executor；如果 loop 线程未退出，会抛出清晰异常。
+- loop 使用标准 asyncio 公开 API：`run_forever()`、`run_coroutine_threadsafe()` 和 shutdown coroutine。
+- 同一个 runtime 实例 `stop()` 后暂不支持 restart，第二次 `start()` 会抛出清晰异常。
+- `ProcessPoolExecutor` 改为按需创建，不用 CPU 节点时不再持有进程池。
+- 如果图中已有 CPU 节点，`start()` 会在 loop 子线程启动前预热 CPU 进程池，避免多线程后再 fork。
+- CPU submit 阶段异常会进入 `runtime.errors`，并发出 `node_error` / `task_done(success=False)` hook。
+- 已补充生命周期测试：loop ready、stop 后 loop 关闭、禁止 restart、CPU submit 失败记录。
+
+验证情况：
+
+- 非沙箱环境 `python -m unittest discover -s tests` 通过，当前 24 个测试。
+- `python -m compileall node_flow tests` 通过。
+- `git diff --check` 通过。
+
+当前保留的问题：
+
+- Codex 沙箱环境下 `call_soon_threadsafe()` 唤醒 selector 不稳定，但非沙箱环境完整测试通过。
+- 主实现不为沙箱限制引入私有 asyncio API、condition 命令泵或 heartbeat 兜底。
+- `stop()` 语义仍然偏“停止 runtime”，不是“等待当前业务全部跑完后再关闭”。
+- `register()` / `connect()` 运行中修改图还没有禁止，也没有并发安全设计。
+- 如果运行中才注册 CPU 节点，会绕过 start 前 CPU pool 预热；后续建议禁止运行中改图。
+- shutdown 阶段异常目前没有结构化记录，后续可以保存为 `_shutdown_error` 或进入 `runtime.errors`。
+
+下一步建议：
+
+1. 禁止 runtime 运行中 `register()` / `connect()` 修改图。
+2. 增加 `drain(timeout=None)`，等待业务 pending 归零。
+3. 增加 `stop(graceful=True)` 或等价 API，明确区分立即停止和优雅停止。
+4. 将 future 管理升级为任务表，为任务 ID、取消、超时和详情统计做准备。
 
 ### 1. Runtime hook 增强
 

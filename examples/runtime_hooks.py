@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Show how to observe WorkflowRuntime with hooks."""
+"""演示如何通过 hook 观察 WorkflowRuntime。"""
 
 import threading
 import time

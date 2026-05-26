@@ -28,7 +28,7 @@ def cpu_add_one(event: Event):
 
 
 def cpu_fail(event: Event):
-    raise RuntimeError("cpu failed")
+    raise RuntimeError("CPU 执行失败")
 
 
 class RuntimeEntryTests(unittest.TestCase):
@@ -54,7 +54,7 @@ class RuntimeEntryTests(unittest.TestCase):
         runtime.start()
         try:
             runtime.trigger(start, {"value": 1})
-            self.assertTrue(done.wait(2), "trigger did not reach downstream node")
+            self.assertTrue(done.wait(2), "trigger 没有到达下游节点")
         finally:
             runtime.stop()
 
@@ -88,14 +88,14 @@ class RuntimeEntryTests(unittest.TestCase):
         runtime.start()
         try:
             runtime.emit(source, {"value": 1})
-            self.assertTrue(done.wait(2), "emit did not reach downstream node")
+            self.assertTrue(done.wait(2), "emit 没有到达下游节点")
         finally:
             runtime.stop()
 
         self.assertEqual(calls, [("sink", {"value": 1})])
 
     def test_router_dispatches_only_selected_branch_once(self) -> None:
-        """RouterNode filters one hop and lets the selected branch continue."""
+        """RouterNode 只过滤当前一跳，并允许选中的分支继续传播。"""
         calls = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=4)
@@ -126,7 +126,7 @@ class RuntimeEntryTests(unittest.TestCase):
         runtime.start()
         try:
             runtime.trigger(router, {"kind": "image"})
-            self.assertTrue(done.wait(2), "selected branch did not reach sink")
+            self.assertTrue(done.wait(2), "选中的分支没有到达 sink")
         finally:
             runtime.stop()
 
@@ -139,7 +139,7 @@ class RuntimeEntryTests(unittest.TestCase):
         )
 
     def test_router_empty_route_stops_propagation(self) -> None:
-        """RouterNode returning an empty list means no downstream branch is selected."""
+        """RouterNode 返回空列表表示不选择任何下游分支。"""
         calls = []
         runtime = WorkflowRuntime(max_workers=2)
 
@@ -162,12 +162,12 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_sync_node_error_is_recorded_and_stops_branch(self) -> None:
-        """A failing sync node records an error event and does not call downstream."""
+        """同步节点失败时会记录错误事件，并且不调用下游节点。"""
         calls = []
         runtime = WorkflowRuntime(max_workers=2)
 
         def bad_fn(event: Event):
-            raise ValueError("bad payload")
+            raise ValueError("无效 payload")
 
         def sink_fn(event: Event):
             calls.append(("sink", dict(event.payload)))
@@ -192,11 +192,11 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(error.name, "error")
         self.assertEqual(error.payload["node_id"], "bad")
         self.assertEqual(error.payload["error_type"], "ValueError")
-        self.assertEqual(error.payload["error_message"], "bad payload")
+        self.assertEqual(error.payload["error_message"], "无效 payload")
         self.assertEqual(error.payload["payload"], {"value": 1})
 
     def test_async_node_result_reaches_downstream(self) -> None:
-        """AsyncFunctionNode runs on the asyncio loop and propagates its result."""
+        """AsyncFunctionNode 会在 asyncio loop 上执行，并传播处理结果。"""
         calls = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=2)
@@ -217,19 +217,19 @@ class RuntimeEntryTests(unittest.TestCase):
         runtime.start()
         try:
             runtime.trigger(async_node, {"value": 1})
-            self.assertTrue(done.wait(2), "async node did not reach sink")
+            self.assertTrue(done.wait(2), "异步节点没有到达 sink")
         finally:
             runtime.stop()
 
         self.assertEqual(calls, [("sink", {"value": 2})])
 
     def test_async_node_error_is_recorded(self) -> None:
-        """AsyncFunctionNode errors are recorded and stop the branch."""
+        """AsyncFunctionNode 异常会被记录，并停止当前分支。"""
         calls = []
         runtime = WorkflowRuntime(max_workers=2)
 
         async def bad_async_fn(event: Event):
-            raise RuntimeError("async failed")
+            raise RuntimeError("异步执行失败")
 
         def sink_fn(event: Event):
             calls.append(("sink", dict(event.payload)))
@@ -252,7 +252,7 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(runtime.errors[0].payload["error_type"], "RuntimeError")
 
     def test_cpu_node_result_reaches_downstream(self) -> None:
-        """CpuNode runs in the process pool and propagates its result."""
+        """CpuNode 会在进程池中执行，并传播处理结果。"""
         calls = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=2, max_cpu_workers=1)
@@ -270,14 +270,14 @@ class RuntimeEntryTests(unittest.TestCase):
         runtime.start()
         try:
             runtime.trigger(cpu, {"value": 1})
-            self.assertTrue(done.wait(5), "cpu node did not reach sink")
+            self.assertTrue(done.wait(5), "CPU 节点没有到达 sink")
         finally:
             runtime.stop()
 
         self.assertEqual(calls, [("sink", {"value": 2})])
 
     def test_cpu_node_error_is_recorded(self) -> None:
-        """CpuNode process-pool errors are recorded and stop the branch."""
+        """CpuNode 进程池异常会被记录，并停止当前分支。"""
         calls = []
         runtime = WorkflowRuntime(max_workers=2, max_cpu_workers=1)
 
@@ -305,8 +305,41 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(runtime.errors[0].payload["node_id"], "bad_cpu")
         self.assertEqual(runtime.errors[0].payload["error_type"], "RuntimeError")
 
+    def test_cpu_submit_error_is_recorded(self) -> None:
+        """CPU 执行器提交失败时应记录错误，而不是从 trigger 抛出。"""
+        calls = []
+        runtime = WorkflowRuntime(max_workers=2, max_cpu_workers=1)
+
+        class BrokenCpuExecutor:
+            def submit(self, *args, **kwargs):
+                raise PermissionError("CPU 执行器不可用")
+
+            def shutdown(self, *args, **kwargs):
+                return None
+
+        cpu = runtime.register(CpuNode("cpu", cpu_add_one))
+
+        def sink_fn(event: Event):
+            calls.append(("sink", dict(event.payload)))
+            return None
+
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+        runtime.connect(cpu, sink)
+
+        runtime.start()
+        try:
+            runtime.cpu_executor = BrokenCpuExecutor()  # type: ignore[assignment]
+            runtime.trigger(cpu, {"value": 1})
+        finally:
+            runtime.stop()
+
+        self.assertEqual(calls, [])
+        self.assertEqual(len(runtime.errors), 1)
+        self.assertEqual(runtime.errors[0].payload["node_id"], "cpu")
+        self.assertEqual(runtime.errors[0].payload["error_type"], "PermissionError")
+
     def test_timer_source_emits_count_limit_events(self) -> None:
-        """TimerSource emits the configured number of events."""
+        """TimerSource 会按 count_limit 发出指定数量的事件。"""
         payloads = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=2)
@@ -324,14 +357,14 @@ class RuntimeEntryTests(unittest.TestCase):
 
         runtime.start()
         try:
-            self.assertTrue(done.wait(2), "timer did not emit expected events")
+            self.assertTrue(done.wait(2), "timer 没有发出预期事件")
         finally:
             runtime.stop()
 
         self.assertEqual([payload["count"] for payload in payloads], [0, 1, 2])
 
     def test_timer_source_shares_async_loop(self) -> None:
-        """TimerSource runs on the shared asyncio loop and still emits events."""
+        """TimerSource 在共享 asyncio loop 上运行，并能正常发出事件。"""
         payloads = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=2)
@@ -349,14 +382,14 @@ class RuntimeEntryTests(unittest.TestCase):
 
         runtime.start()
         try:
-            self.assertTrue(done.wait(2), "shared-loop timer did not emit expected events")
+            self.assertTrue(done.wait(2), "共享 loop 的 timer 没有发出预期事件")
         finally:
             runtime.stop()
 
         self.assertEqual([payload["count"] for payload in payloads], [0, 1])
 
     def test_filter_node_allows_true_and_blocks_false(self) -> None:
-        """FilterNode propagates True predicates and blocks False predicates."""
+        """FilterNode 放行 True 条件，并阻断 False 条件。"""
         calls = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=2)
@@ -380,7 +413,7 @@ class RuntimeEntryTests(unittest.TestCase):
         try:
             runtime.trigger(source, {"allow": True})
             runtime.trigger(source, {"allow": False})
-            self.assertTrue(done.wait(2), "allowed event did not reach sink")
+            self.assertTrue(done.wait(2), "放行事件没有到达 sink")
             threading.Event().wait(0.1)
         finally:
             runtime.stop()
@@ -388,7 +421,7 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(calls, [{"allow": True}])
 
     def test_pending_count_tracks_sync_futures(self) -> None:
-        """Runtime tracks unfinished sync futures and removes them when done."""
+        """Runtime 会追踪未完成的同步 future，并在完成后移除。"""
         started = threading.Event()
         release = threading.Event()
         done = threading.Event()
@@ -405,10 +438,10 @@ class RuntimeEntryTests(unittest.TestCase):
         runtime.start()
         try:
             runtime.trigger(slow, {"value": 1})
-            self.assertTrue(started.wait(2), "slow node did not start")
+            self.assertTrue(started.wait(2), "慢节点没有启动")
             self.assertGreaterEqual(runtime.pending_count(), 1)
             release.set()
-            self.assertTrue(done.wait(2), "slow node did not finish")
+            self.assertTrue(done.wait(2), "慢节点没有完成")
 
             for _ in range(20):
                 if runtime.pending_count() == 0:
@@ -420,7 +453,7 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(runtime.pending_count(), 0)
 
     def test_pending_count_tracks_async_futures(self) -> None:
-        """Runtime tracks unfinished async futures and removes them when done."""
+        """Runtime 会追踪未完成的异步 future，并在完成后移除。"""
         calls = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=1)
@@ -437,7 +470,7 @@ class RuntimeEntryTests(unittest.TestCase):
         try:
             runtime.trigger(async_node, {"value": 1})
             self.assertGreaterEqual(runtime.pending_count(), 1)
-            self.assertTrue(done.wait(2), "async node did not finish")
+            self.assertTrue(done.wait(2), "异步节点没有完成")
 
             for _ in range(20):
                 if runtime.pending_count() == 0:
@@ -450,7 +483,7 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertEqual(runtime.pending_count(), 0)
 
     def test_wait_until_returns_when_event_is_set(self) -> None:
-        """Runtime.wait_until blocks until the completion event is set."""
+        """Runtime.wait_until 会阻塞到完成事件被设置。"""
         runtime = WorkflowRuntime(max_workers=1)
         done = threading.Event()
 
@@ -462,8 +495,41 @@ class RuntimeEntryTests(unittest.TestCase):
 
         self.assertTrue(runtime.wait_until(done, timeout=1.0))
 
+    def test_start_waits_until_async_loop_is_ready(self) -> None:
+        """start 会等待共享 asyncio loop 可以执行任务后再返回。"""
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=1)
+
+        async def mark_done(event: Event):
+            done.set()
+            return None
+
+        async_node = runtime.register(AsyncFunctionNode("async_ready", mark_done))
+
+        runtime.start()
+        try:
+            runtime.trigger(async_node, {"value": 1})
+            self.assertTrue(done.wait(2), "start 返回后 async loop 仍未 ready")
+        finally:
+            runtime.stop()
+
+    def test_stop_closes_loop_and_prevents_restart(self) -> None:
+        """stop 会关闭 runtime 资源，并明确禁止 restart。"""
+        runtime = WorkflowRuntime(max_workers=1)
+
+        runtime.start()
+        runtime.stop()
+
+        self.assertFalse(runtime.running)
+        self.assertIsNotNone(runtime.loop)
+        self.assertTrue(runtime.loop.is_closed())
+        self.assertIsNone(runtime._loop_thread)
+
+        with self.assertRaises(RuntimeError):
+            runtime.start()
+
     def test_stats_reports_basic_runtime_state(self) -> None:
-        """Runtime.stats returns basic runtime state without requiring psutil."""
+        """Runtime.stats 不依赖 psutil 也会返回基础运行状态。"""
         runtime = WorkflowRuntime(max_workers=1)
 
         stats = runtime.stats()
@@ -475,10 +541,11 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertIn("timer_count", stats)
         self.assertIn("cpu_count", stats)
         self.assertIn("loop_thread_alive", stats)
+        self.assertIn("stopping", stats)
         self.assertEqual(stats["pending_count"], stats["pending_stats"]["total_pending"])
 
     def test_pending_stats_reports_split_counts(self) -> None:
-        """Runtime.pending_stats returns split counts for each executor."""
+        """Runtime.pending_stats 会按执行器返回 pending 数量。"""
         runtime = WorkflowRuntime(max_workers=1)
 
         stats = runtime.pending_stats()
@@ -490,7 +557,7 @@ class RuntimeEntryTests(unittest.TestCase):
         self.assertIn("total_pending", stats)
 
     def test_hooks_observe_task_lifecycle_and_dispatch(self) -> None:
-        """Runtime hooks receive task, node, and dispatch events."""
+        """Runtime hook 能观察任务、节点和事件分发过程。"""
         events = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=2)
@@ -514,7 +581,7 @@ class RuntimeEntryTests(unittest.TestCase):
         runtime.start()
         try:
             runtime.trigger(start, {"value": 1})
-            self.assertTrue(done.wait(2), "hook test flow did not finish")
+            self.assertTrue(done.wait(2), "hook 测试流程没有完成")
         finally:
             runtime.stop()
 
@@ -545,13 +612,13 @@ class RuntimeEntryTests(unittest.TestCase):
         )
 
     def test_hook_errors_do_not_break_runtime(self) -> None:
-        """A failing hook is ignored so runtime execution can continue."""
+        """hook 自身异常会被忽略，不会打断 runtime 执行。"""
         events = []
         done = threading.Event()
         runtime = WorkflowRuntime(max_workers=1)
 
         def broken_hook(kind: str, data: dict) -> None:
-            raise RuntimeError("hook failed")
+            raise RuntimeError("hook 执行失败")
 
         def recorder(kind: str, data: dict) -> None:
             events.append((kind, dict(data)))
@@ -569,7 +636,7 @@ class RuntimeEntryTests(unittest.TestCase):
         runtime.start()
         try:
             runtime.trigger(bad, {"value": 1})
-            self.assertTrue(done.wait(2), "node_error hook was not emitted")
+            self.assertTrue(done.wait(2), "没有发出 node_error hook")
         finally:
             runtime.stop()
 
