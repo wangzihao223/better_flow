@@ -11,8 +11,9 @@ from __future__ import annotations
 """
 
 import time
+import threading
 
-from node_flow import Event, FunctionNode, PrintSink, RouterNode, TimerSource, WorkflowRuntime
+from node_flow import Event, FunctionNode, RouterNode, TimerSource, WorkflowRuntime
 
 
 def route(event: Event) -> str:
@@ -41,12 +42,23 @@ def slow_process(event: Event):
 
 def main() -> None:
     runtime = WorkflowRuntime(max_workers=4, max_cpu_workers=1)
+    done = threading.Event()
+    received = []
+    expected_count = 5
 
     timer = runtime.register(TimerSource("timer", interval=0.5, count_limit=6))
     router = runtime.register(RouterNode("router", route))
     fast = runtime.register(FunctionNode("fast", fast_process))
     slow = runtime.register(FunctionNode("slow", slow_process))
-    sink = runtime.register(PrintSink("sink"))
+
+    def sink_process(event: Event):
+        received.append(event.payload["count"])
+        print(f"[sink] from={event.source} trace={event.trace} payload={event.payload}")
+        if event.payload["count"] == expected_count:
+            done.set()
+        return None
+
+    sink = runtime.register(FunctionNode("sink", sink_process))
 
     runtime.connect(timer, router)
     runtime.connect(router, fast)
@@ -56,7 +68,7 @@ def main() -> None:
 
     runtime.start()
     try:
-        time.sleep(4)
+        runtime.wait_until(done)
     finally:
         runtime.stop()
 
