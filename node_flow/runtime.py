@@ -87,10 +87,13 @@ class WorkflowRuntime:
 
     def _start_timer(self, node: TimerSource) -> None:
         """为 TimerSource 启动由 runtime 管理的定时触发循环。"""
+
         # TimerSource 由 runtime 统一轮询，不允许节点自己开循环。
         def loop() -> None:
             count = 0
-            while self.running and (node.count_limit is None or count < node.count_limit):
+            while self.running and (
+                node.count_limit is None or count < node.count_limit
+            ):
                 payload = node.make_payload(count)
                 self.emit(node, payload, name="tick")
                 count += 1
@@ -104,6 +107,12 @@ class WorkflowRuntime:
         """从 source 节点创建一个新事件，并分发给它的下游节点。"""
         event = Event(source=source.node_id, name=name, payload=payload)
         self.dispatch(source, event)
+        return event
+
+    def trigger(self, node: BaseNode, payload, name: str = "event") -> Event:
+        """把事件投递给某个节点执行"""
+        event = Event(source="runtime", name=name, payload=payload)
+        self._submit(node, event)
         return event
 
     def forward(self, source: BaseNode, event: Event) -> None:
@@ -138,10 +147,14 @@ class WorkflowRuntime:
             return
         if target.execution_mode == ExecutionMode.CPU:
             future = self.cpu_executor.submit(target.process, event)
-            future.add_done_callback(lambda result: self._handle_cpu_result(target, event, result))
+            future.add_done_callback(
+                lambda result: self._handle_cpu_result(target, event, result)
+            )
             return
         if target.execution_mode == ExecutionMode.ASYNC:
-            asyncio.run_coroutine_threadsafe(self._execute_node_async(target, event), self.loop)
+            asyncio.run_coroutine_threadsafe(
+                self._execute_node_async(target, event), self.loop
+            )
             return
         self.io_executor.submit(self._execute_node_sync, target, event)
 
