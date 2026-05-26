@@ -2,8 +2,8 @@ from __future__ import annotations
 
 """运行时调度器。
 
-WorkflowRuntime 统一管理节点注册、事件分发、线程池、进程池、asyncio
-事件循环和定时触发，不让节点自己掌控执行资源。
+WorkflowRuntime 负责执行层：节点注册、事件分发、线程池、进程池、asyncio
+事件循环和定时触发。图结构本身交给 WorkflowGraph 维护。
 """
 
 import asyncio
@@ -11,9 +11,10 @@ import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
-from typing import Dict, Iterable
+from typing import Iterable
 
 from .event import Event
+from .graph import WorkflowGraph
 from .nodes import BaseNode, ExecutionMode, TimerSource
 
 
@@ -30,21 +31,21 @@ class WorkflowRuntime:
         self.io_executor = ThreadPoolExecutor(max_workers=max_workers)
         self.cpu_executor = ProcessPoolExecutor(max_workers=max_cpu_workers)
         self.loop = asyncio.new_event_loop()
-        self.nodes: Dict[str, BaseNode] = {}
+        self.graph = WorkflowGraph()
+        self.nodes = self.graph.nodes
         self.running = False
         self._loop_thread: threading.Thread | None = None
         self._timer_threads: list[threading.Thread] = []
 
     def register(self, node: BaseNode) -> BaseNode:
         """注册节点，并把 runtime 绑定到节点上。"""
-        self.nodes[node.node_id] = node
+        self.graph.add_node(node)
         node.bind_runtime(self)
         return node
 
     def connect(self, source: BaseNode, target: BaseNode) -> BaseNode:
         """连接两个节点，表示 source 的事件可以流向 target。"""
-        source.connect(target)
-        return target
+        return self.graph.connect(source, target)
 
     def start(self) -> None:
         """启动运行时。
@@ -81,14 +82,12 @@ class WorkflowRuntime:
 
     def _run_loop(self) -> None:
         """在独立线程中运行 asyncio 事件循环。"""
-        # 单独起一个线程承载 asyncio loop，供异步节点调度。
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
     def _start_timer(self, node: TimerSource) -> None:
         """为 TimerSource 启动由 runtime 管理的定时触发循环。"""
 
-        # TimerSource 由 runtime 统一轮询，不允许节点自己开循环。
         def loop() -> None:
             count = 0
             while self.running and (
@@ -110,7 +109,7 @@ class WorkflowRuntime:
         return event
 
     def trigger(self, node: BaseNode, payload, name: str = "event") -> Event:
-        """把事件投递给某个节点执行"""
+        """把事件投递给指定节点自己，触发该节点执行。"""
         event = Event(source="runtime", name=name, payload=payload)
         self._submit(node, event)
         return event
@@ -131,7 +130,7 @@ class WorkflowRuntime:
 
     def dispatch(self, source: BaseNode, event: Event) -> None:
         """把事件从 source 分发给它的下游节点。"""
-        for target in list(source.output_nodes):
+        for target in self.graph.downstream(source):
             target_event = self._build_event(event, source, target)
             self._submit(target, target_event)
 
@@ -180,7 +179,6 @@ class WorkflowRuntime:
 
     def _handle_result(self, node: BaseNode, event: Event, result) -> None:
         """把节点返回值转换成后续事件传播行为。"""
-        # 节点返回 Event / list / 普通值时，统一转成下游可消费的事件。
         if result is None:
             return
         if isinstance(result, Event):

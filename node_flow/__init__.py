@@ -4,6 +4,7 @@
 """
 
 from .event import Event
+from .graph import WorkflowGraph
 from .runtime import WorkflowRuntime
 from .nodes import (
     AsyncFunctionNode,
@@ -21,6 +22,7 @@ from .nodes import (
 
 __all__ = [
     "Event",
+    "WorkflowGraph",
     "WorkflowRuntime",
     "BaseNode",
     "ExecutionMode",
