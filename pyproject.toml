@@ -24,6 +24,10 @@ classifiers = [
 Homepage = "https://github.com/your-name/node-flow"
 Repository = "https://github.com/your-name/node-flow"
 
+[project.optional-dependencies]
+docs = [
+  "sphinx>=8.0",
+]
+
 [tool.setuptools]
 packages = ["node_flow"]
-

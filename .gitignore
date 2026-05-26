@@ -9,4 +9,6 @@ build/
 dist/
 *.egg-info/
 .venv/
+.venv-docs/
 venv/
+docs/_build/
