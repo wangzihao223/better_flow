@@ -21,6 +21,10 @@ class WorkflowRuntime:
     """节点图的统一运行时。"""
 
     def __init__(self, max_workers: int = 8, max_cpu_workers: int | None = None):
+        """初始化运行时资源。
+
+        max_workers 控制同步/IO 线程池大小，max_cpu_workers 控制 CPU 进程池大小。
+        """
         self.max_workers = max_workers
         self.max_cpu_workers = max_cpu_workers
         self.io_executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -32,15 +36,22 @@ class WorkflowRuntime:
         self._timer_threads: list[threading.Thread] = []
 
     def register(self, node: BaseNode) -> BaseNode:
+        """注册节点，并把 runtime 绑定到节点上。"""
         self.nodes[node.node_id] = node
         node.bind_runtime(self)
         return node
 
     def connect(self, source: BaseNode, target: BaseNode) -> BaseNode:
+        """连接两个节点，表示 source 的事件可以流向 target。"""
         source.connect(target)
         return target
 
     def start(self) -> None:
+        """启动运行时。
+
+        这里只打开 runtime/node 状态和异步事件循环；普通节点不会立刻执行，
+        只有事件到达时才会被调度。
+        """
         if self.running:
             return
         self.running = True
@@ -52,6 +63,7 @@ class WorkflowRuntime:
                 self._start_timer(node)
 
     def stop(self) -> None:
+        """停止运行时，并等待已经提交的任务完成。"""
         if not self.running:
             return
         self.running = False
@@ -68,11 +80,13 @@ class WorkflowRuntime:
         self.cpu_executor.shutdown(wait=True, cancel_futures=False)
 
     def _run_loop(self) -> None:
+        """在独立线程中运行 asyncio 事件循环。"""
         # 单独起一个线程承载 asyncio loop，供异步节点调度。
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
     def _start_timer(self, node: TimerSource) -> None:
+        """为 TimerSource 启动由 runtime 管理的定时触发循环。"""
         # TimerSource 由 runtime 统一轮询，不允许节点自己开循环。
         def loop() -> None:
             count = 0
@@ -87,30 +101,39 @@ class WorkflowRuntime:
         thread.start()
 
     def emit(self, source: BaseNode, payload, name: str = "event") -> Event:
+        """从 source 节点创建一个新事件，并分发给它的下游节点。"""
         event = Event(source=source.node_id, name=name, payload=payload)
         self.dispatch(source, event)
         return event
 
     def forward(self, source: BaseNode, event: Event) -> None:
+        """转发已有事件。
+
+        目前主要保留给兼容旧式节点调用；新节点更推荐通过返回值继续传播。
+        """
         event.source = source.node_id
         self.dispatch(source, event)
 
     def _build_event(self, event: Event, source: BaseNode, target: BaseNode) -> Event:
+        """复制事件并记录它即将流向的目标节点。"""
         target_event = event.fork(target.node_id)
         target_event.source = source.node_id
         return target_event
 
     def dispatch(self, source: BaseNode, event: Event) -> None:
+        """把事件从 source 分发给它的下游节点。"""
         for target in list(source.output_nodes):
             target_event = self._build_event(event, source, target)
             self._submit(target, target_event)
 
     def broadcast(self, targets: Iterable[BaseNode], event: Event) -> None:
+        """把同一个事件广播给指定的一组目标节点。"""
         for target in targets:
             target_event = event.fork(target.node_id)
             self._submit(target, target_event)
 
     def _submit(self, target: BaseNode, event: Event) -> None:
+        """根据目标节点的执行模式，把任务提交到合适的执行器。"""
         if not self.running:
             return
         if target.execution_mode == ExecutionMode.CPU:
@@ -123,23 +146,27 @@ class WorkflowRuntime:
         self.io_executor.submit(self._execute_node_sync, target, event)
 
     def _execute_node_sync(self, node: BaseNode, event: Event) -> None:
+        """在线程池里执行同步节点。"""
         if not self.running or not node.running:
             return
         result = node.process(event)
         self._handle_result(node, event, result)
 
     def _handle_cpu_result(self, node: BaseNode, event: Event, future) -> None:
+        """处理进程池任务完成后的返回值。"""
         if not self.running or not node.running:
             return
         self._handle_result(node, event, future.result())
 
     async def _execute_node_async(self, node: BaseNode, event: Event) -> None:
+        """在 asyncio loop 中执行异步节点。"""
         if not self.running or not node.running:
             return
         result = await node.process_async(event)  # type: ignore[attr-defined]
         self._handle_result(node, event, result)
 
     def _handle_result(self, node: BaseNode, event: Event, result) -> None:
+        """把节点返回值转换成后续事件传播行为。"""
         # 节点返回 Event / list / 普通值时，统一转成下游可消费的事件。
         if result is None:
             return
