@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import unittest
 
-from node_flow import Event, FunctionNode, WorkflowRuntime
+from node_flow import Event, FunctionNode, RouterNode, WorkflowRuntime
 
 
 class RuntimeEntryTests(unittest.TestCase):
@@ -74,6 +74,50 @@ class RuntimeEntryTests(unittest.TestCase):
             runtime.stop()
 
         self.assertEqual(calls, [("sink", {"value": 1})])
+
+    def test_router_dispatches_only_selected_branch_once(self) -> None:
+        """RouterNode filters one hop and lets the selected branch continue."""
+        calls = []
+        done = threading.Event()
+        runtime = WorkflowRuntime(max_workers=4)
+
+        router = runtime.register(RouterNode("router", lambda event: "image"))
+
+        def image_fn(event: Event):
+            calls.append(("image", dict(event.payload)))
+            return event.payload
+
+        def text_fn(event: Event):
+            calls.append(("text", dict(event.payload)))
+            return event.payload
+
+        def sink_fn(event: Event):
+            calls.append(("sink", dict(event.payload)))
+            done.set()
+            return None
+
+        image = runtime.register(FunctionNode("image", image_fn))
+        text = runtime.register(FunctionNode("text", text_fn))
+        sink = runtime.register(FunctionNode("sink", sink_fn))
+
+        runtime.connect(router, image)
+        runtime.connect(router, text)
+        runtime.connect(image, sink)
+
+        runtime.start()
+        try:
+            runtime.trigger(router, {"kind": "image"})
+            self.assertTrue(done.wait(2), "selected branch did not reach sink")
+        finally:
+            runtime.stop()
+
+        self.assertEqual(
+            calls,
+            [
+                ("image", {"kind": "image"}),
+                ("sink", {"kind": "image"}),
+            ],
+        )
 
 
 if __name__ == "__main__":
